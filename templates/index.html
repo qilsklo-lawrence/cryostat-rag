@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Attocube RAG Assistant</title>
+    <title>Proteox RAG Assistant</title>
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
@@ -743,7 +743,7 @@
     <div class="main-container">
         <!-- Header -->
         <div class="header">
-            <h1>Attocube RAG Assistant</h1>
+            <h1>Proteox RAG Assistant</h1>
             <div class="user-info">
                 <span class="user-email">{{ session.user_email }}</span>
                 <button class="logout-btn" onclick="window.location.href='/logout'">Logout</button>
@@ -759,7 +759,7 @@
                 <textarea 
                     class="input-field" 
                     id="messageInput" 
-                    placeholder="Ask about Attocube documentation..."
+                    placeholder="Ask about Proteox documentation..."
                     rows="1"
                     onkeydown="handleKeyDown(event)"
                 ></textarea>
@@ -772,7 +772,7 @@
     <div class="app-loading" id="appLoading">
         <div class="loading-content">
             <div class="loading-spinner"></div>
-            <h2>Initializing Attocube Assistant</h2>
+            <h2>Initializing Proteox Assistant</h2>
             <p>Setting up the interface...</p>
         </div>
     </div>
@@ -991,41 +991,6 @@
                 document.getElementById('sendButton').disabled = false;
                 input.focus();
             }
-        }
-
-        function parseMarkdown(text) {
-            // Simple markdown parser for common formatting
-            let html = text;
-            
-            // Convert **bold** to <strong>
-            html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-            
-            // Convert *italic* to <em>
-            html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
-            
-            // Convert `code` to <code>
-            html = html.replace(/`(.*?)`/g, '<code>$1</code>');
-            
-            // Convert numbered lists
-            html = html.replace(/^\s*(\d+\.)\s+(.*$)/gm, '<ol><li>$2</li></ol>');
-            
-            // Convert bullet points
-            html = html.replace(/^\s*[-*+]\s+(.*$)/gm, '<ul><li>$1</li></ul>');
-            
-            // Merge consecutive list items
-            html = html.replace(/<\/ol>\s*<ol>/g, '');
-            html = html.replace(/<\/ul>\s*<ul>/g, '');
-            
-            // Convert line breaks to <br> but preserve paragraph structure
-            html = html.replace(/\n\n/g, '</p><p>');
-            html = html.replace(/\n/g, '<br>');
-            
-            // Wrap in paragraph tags if not already wrapped
-            if (!html.startsWith('<p>') && !html.startsWith('<ol>') && !html.startsWith('<ul>')) {
-                html = '<p>' + html + '</p>';
-            }
-            
-            return html;
         }
 
         function addMessage(content, type, sources = null, images = null, debugInfo = null) {
@@ -1279,7 +1244,7 @@
             loadingOverlay.innerHTML = `
                 <div class="loading-content">
                     <div class="loading-spinner"></div>
-                    <h2>Initializing Attocube Assistant</h2>
+                    <h2>Initializing Proteox Assistant</h2>
                     <p>Setting up the interface...</p>
                 </div>
             `;

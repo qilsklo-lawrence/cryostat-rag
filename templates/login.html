@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - Attocube RAG Assistant</title>
+    <title>Login - Proteox RAG Assistant</title>
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500&display=swap" rel="stylesheet">
     <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
@@ -70,7 +70,7 @@
 <body>
     <div class="login-container">
         <div class="logo">🔬</div>
-        <h1>Attocube RAG Assistant</h1>
+        <h1>Proteox RAG Assistant</h1>
         <p class="subtitle">Sign in to continue</p>
         
         <div id="g_id_onload"
@@ -89,7 +89,7 @@
         </div>
         
         <div class="domain-notice">
-            Only @lbl.gov email addresses are allowed
+            Only @uci.edu email addresses are allowed
         </div>
         
         <div class="error-message" id="errorMessage"></div>
@@ -112,7 +112,7 @@
                     window.location.href = '/';
                 } else {
                     document.getElementById('errorMessage').textContent = 
-                        data.error || 'Authentication failed. Please use an @lbl.gov email address.';
+                        data.error || 'Authentication failed. Please use an @uci.edu email address.';
                     document.getElementById('errorMessage').style.display = 'block';
                 }
             })

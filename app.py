@@ -17,7 +17,7 @@ CORS(app)
 
 # Google OAuth settings
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
-ALLOWED_DOMAIN = "@lbl.gov"
+ALLOWED_DOMAIN = "@uci.edu"
 
 # Local development mode - set this environment variable to bypass authentication
 LOCAL_DEV_MODE = os.environ.get("LOCAL_DEV_MODE", "false").lower() == "true"
@@ -143,7 +143,7 @@ def auth():
         
         email = idinfo['email']
         
-        # Check if email ends with @lbl.gov
+        # Check if email ends with @uci.edu
         if not email.endswith(ALLOWED_DOMAIN):
             return jsonify({'error': 'Unauthorized domain'}), 403
         
