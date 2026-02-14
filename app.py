@@ -9,7 +9,13 @@ from functools import wraps
 import secrets
 import threading
 import time
-from rag import initialize_rag_system, process_query, ConversationHistory
+from rag import (
+    process_query,
+    ConversationHistory,
+    load_rag_if_available,
+    verify_or_rebuild_rag,
+    sync_vectorstore_from_gcs
+)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
@@ -33,50 +39,106 @@ else:
 
 print(f"LOCAL_DEV_MODE: {LOCAL_DEV_MODE}")
 
-# Global RAG components (initialized on startup)
+# Global RAG components (initialized lazily)
 retriever = None
 llm = None
 conversations = {}  # Store conversations per session
 rag_initialized = False
 initialization_error = None
+rag_init_lock = threading.RLock()
+rag_background_thread = None
+rag_thread_lock = threading.Lock()
+
+rag_state = {
+    "status": "idle",
+    "message": "Knowledge base not initialized yet",
+    "build_in_progress": False,
+    "last_build_time": None,
+    "last_checked": None,
+    "last_error": None
+}
 
 # Status tracking for SSE
 status_updates = {}  # Store status updates per session
 status_lock = threading.Lock()  # Thread safety for status updates
 
-# Initialize RAG system on startup
-def initialize_rag_on_startup():
-    global retriever, llm, rag_initialized, initialization_error
-    try:
-        print("Starting RAG system initialization...")
-        retriever, llm = initialize_rag_system()
-        rag_initialized = True
-        print("RAG system ready!")
-    except Exception as e:
-        print(f"Failed to initialize RAG system: {e}")
-        initialization_error = str(e)
-        raise e
+def _set_rag_state(status: str, message: str = None, build_in_progress: bool = None, error: str = None):
+    with rag_init_lock:
+        rag_state["status"] = status
+        if message is not None:
+            rag_state["message"] = message
+        if build_in_progress is not None:
+            rag_state["build_in_progress"] = build_in_progress
+        if error is not None:
+            rag_state["last_error"] = error
+        rag_state["last_checked"] = time.time()
 
-# Start initialization in background when app starts
-print("App starting - checking if we should initialize RAG...")
-if not rag_initialized and not initialization_error:
+def _background_verify_or_rebuild():
+    global retriever, llm, rag_initialized, initialization_error
+    _set_rag_state("updating", "Checking for document updates...", build_in_progress=True)
     try:
-        print("Starting RAG initialization on app startup...")
-        initialize_rag_on_startup()
-        print(f"App startup: RAG initialization complete. rag_initialized={rag_initialized}")
+        def status_callback(status, msg=None):
+            _set_rag_state("updating", msg or status, build_in_progress=True)
+
+        sync_vectorstore_from_gcs()
+        new_retriever, new_llm, info = verify_or_rebuild_rag(status_callback=status_callback)
+
+        with rag_init_lock:
+            retriever = new_retriever
+            llm = new_llm
+            rag_initialized = True
+            initialization_error = None
+            rag_state["last_build_time"] = time.time()
+            rag_state["build_in_progress"] = False
+            if info.get("rebuilt"):
+                rag_state["status"] = "ready"
+                rag_state["message"] = "Knowledge base rebuilt and ready"
+            else:
+                rag_state["status"] = "ready"
+                rag_state["message"] = "Knowledge base verified and ready"
     except Exception as e:
-        print(f"App startup: RAG initialization failed: {e}")
-else:
-    print(f"App startup: Skipping initialization. rag_initialized={rag_initialized}, initialization_error={initialization_error}")
+        initialization_error = str(e)
+        _set_rag_state("error", f"Knowledge base error: {e}", build_in_progress=False, error=str(e))
+
+def _start_background_rag_task():
+    global rag_background_thread
+    with rag_thread_lock:
+        if rag_background_thread and rag_background_thread.is_alive():
+            return
+        rag_background_thread = threading.Thread(target=_background_verify_or_rebuild, daemon=True)
+        rag_background_thread.start()
+
+# Kick off background verification on cold start
+_start_background_rag_task()
 
 def ensure_rag_initialized():
     """Ensure RAG system is initialized"""
-    global rag_initialized, initialization_error
-    if not rag_initialized:
+    global retriever, llm, rag_initialized, initialization_error
+    if rag_initialized:
+        return
+
+    with rag_init_lock:
+        if rag_initialized:
+            return
         if initialization_error:
             raise Exception(f"RAG system failed to initialize: {initialization_error}")
-        else:
-            raise Exception("RAG system is still initializing, please wait...")
+
+        # Fast path: load existing vectorstore from volume (no GCS checks)
+        sync_vectorstore_from_gcs()
+        loaded_retriever, loaded_llm, loaded = load_rag_if_available()
+        if loaded:
+            retriever = loaded_retriever
+            llm = loaded_llm
+            rag_initialized = True
+            _set_rag_state("ready", "Knowledge base loaded from volume", build_in_progress=False)
+            # Verify/update in background
+            _start_background_rag_task()
+            return
+
+        # No existing vectorstore - start background build
+        _set_rag_state("updating", "Building knowledge base in background...", build_in_progress=True)
+        _start_background_rag_task()
+        raise Exception("RAG system is still initializing, please wait...")
 
 def login_required(f):
     @wraps(f)
@@ -298,17 +360,17 @@ def serve_pdf(filename):
     """Serve PDF files directly from the downloaded directory"""
     try:
         # Import here to avoid circular imports
-        from rag import GCS_BUCKET_NAME, GCS_PDF_PREFIX
+        from rag import GCS_BUCKET_NAME, GCS_PDF_PREFIX, PDF_CACHE_DIR
         
         # Security check - only allow PDF files and prevent directory traversal
         if not filename.endswith('.pdf') or '..' in filename or '/' in filename:
             return "Invalid file request", 400
             
         # Download PDFs if not already available locally
-        pdf_folder = "pdfs"  # Local folder where PDFs are stored
+        pdf_folder = PDF_CACHE_DIR  # Local folder where PDFs are stored
         if not os.path.exists(pdf_folder):
             from rag import download_pdfs_from_gcs
-            pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX)
+            pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX, PDF_CACHE_DIR)
         
         # Check if file exists
         pdf_path = os.path.join(pdf_folder, filename)
@@ -340,21 +402,24 @@ def health():
                 **base_response,
                 'status': 'healthy', 
                 'rag_initialized': True,
-                'message': 'RAG system is ready'
+                'message': 'RAG system is ready',
+                'rag_status': rag_state
             })
         elif initialization_error:
             return jsonify({
                 **base_response,
                 'status': 'error', 
                 'rag_initialized': False,
-                'error': initialization_error
+                'error': initialization_error,
+                'rag_status': rag_state
             }), 500
         else:
             return jsonify({
                 **base_response,
                 'status': 'initializing', 
                 'rag_initialized': False,
-                'message': 'RAG system is still initializing...'
+                'message': 'RAG system is still initializing...',
+                'rag_status': rag_state
             })
     except Exception as e:
         return jsonify({
@@ -362,6 +427,19 @@ def health():
             'rag_initialized': False,
             'error': str(e)
         }), 500
+
+@app.route('/rag_status')
+@login_required
+def rag_status():
+    with rag_init_lock:
+        return jsonify({
+            'status': rag_state.get('status'),
+            'message': rag_state.get('message'),
+            'build_in_progress': rag_state.get('build_in_progress'),
+            'last_build_time': rag_state.get('last_build_time'),
+            'last_checked': rag_state.get('last_checked'),
+            'last_error': rag_state.get('last_error')
+        })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
