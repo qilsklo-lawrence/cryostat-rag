@@ -27,7 +27,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 
 # ─── 1. Initialize Vertex AI ─────────────────────────────────────────────────
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "uci-qmdl")
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "mf-crucible")
 LOCATION = os.getenv("GCP_LOCATION", "us-central1")
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
@@ -44,7 +44,7 @@ EXPAND_CONTEXT_BEFORE = int(os.getenv("EXPAND_CONTEXT_BEFORE", "1"))
 EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))
 
 # GCS settings
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "oxford-rag-pdfs")
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "attocube-rag-pdfs")
 GCS_PDF_PREFIX = "pdfs/"
 
 # Persistent storage paths (Cloud Run volume recommended)
