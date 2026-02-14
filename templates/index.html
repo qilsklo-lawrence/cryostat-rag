@@ -53,6 +53,51 @@
             cursor: pointer;
         }
 
+        /* Knowledge Base Status */
+        .kb-status-card {
+            margin-top: 20px;
+            padding: 12px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background-color: #f8f9fa;
+        }
+
+        .kb-status-label {
+            font-size: 11px;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
+            color: #5f6368;
+            margin-bottom: 8px;
+        }
+
+        .kb-status-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .kb-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #9aa0a6;
+        }
+
+        .kb-status-dot.ready { background-color: #34a853; }
+        .kb-status-dot.updating { background-color: #fbbc04; }
+        .kb-status-dot.error { background-color: #ea4335; }
+
+        .kb-status-text {
+            font-size: 13px;
+            color: #3c4043;
+        }
+
+        .kb-status-subtext {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #5f6368;
+        }
+
         /* Main Chat Area */
         .main-container {
             flex: 1;
@@ -736,6 +781,14 @@
                 Debug Mode
             </label>
         </div>
+        <div class="kb-status-card">
+            <div class="kb-status-label">Knowledge Base</div>
+            <div class="kb-status-row">
+                <span class="kb-status-dot" id="kbStatusDot"></span>
+                <span class="kb-status-text" id="kbStatusText">Checking…</span>
+            </div>
+            <div class="kb-status-subtext" id="kbStatusSubtext">Waiting for status</div>
+        </div>
         <button class="clear-button" onclick="clearConversation()">Clear Conversation</button>
     </div>
 
@@ -813,7 +866,8 @@
                         return match.includes('__') ? match : '<em>' + p1 + '</em>';
                     })
                     
-                    // Headers: ### Header, ## Header, # Header
+                    // Headers: #### Header, ### Header, ## Header, # Header
+                    .replace(/^#### (.+)$/gm, '<h4>$1</h4>')
                     .replace(/^### (.+)$/gm, '<h3>$1</h3>')
                     .replace(/^## (.+)$/gm, '<h2>$1</h2>')
                     .replace(/^# (.+)$/gm, '<h1>$1</h1>');
@@ -864,7 +918,7 @@
                 return processedLines.join('\n');
             });
             
-            return formattedParagraphs.filter(p => p.trim()).join('\n\n').replace(/\n/g, '<br>');
+            return formattedParagraphs.filter(p => p.trim()).join('\n\n');
         }
 
         function handleKeyDown(event) {
@@ -995,6 +1049,7 @@
 
         function addMessage(content, type, sources = null, images = null, debugInfo = null) {
             const chatContainer = document.getElementById('chatContainer');
+            const previousScrollHeight = chatContainer.scrollHeight;
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${type}-message`;
 
@@ -1166,8 +1221,13 @@
             messageDiv.appendChild(contentDiv);
             chatContainer.appendChild(messageDiv);
 
-            // Scroll to bottom
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            // For bot responses, keep the view at the top of the new message
+            if (type === 'bot') {
+                chatContainer.scrollTop = previousScrollHeight;
+            } else {
+                // For user messages, keep the latest message visible
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
         }
 
         function showLoading() {
@@ -1232,6 +1292,49 @@
             }
         }
 
+        function formatTimestamp(ts) {
+            if (!ts) return 'No recent updates';
+            const date = new Date(ts * 1000);
+            return `Last checked: ${date.toLocaleTimeString()}`;
+        }
+
+        function updateKbStatusUI(data) {
+            const dot = document.getElementById('kbStatusDot');
+            const text = document.getElementById('kbStatusText');
+            const subtext = document.getElementById('kbStatusSubtext');
+
+            if (!dot || !text || !subtext) return;
+
+            dot.classList.remove('ready', 'updating', 'error');
+
+            const status = data?.status || 'idle';
+            if (status === 'ready') {
+                dot.classList.add('ready');
+                text.textContent = 'Ready';
+            } else if (status === 'updating') {
+                dot.classList.add('updating');
+                text.textContent = 'Updating';
+            } else if (status === 'error') {
+                dot.classList.add('error');
+                text.textContent = 'Error';
+            } else {
+                text.textContent = 'Idle';
+            }
+
+            subtext.textContent = data?.message || formatTimestamp(data?.last_checked);
+        }
+
+        async function refreshKbStatus() {
+            try {
+                const response = await fetch('/rag_status');
+                if (!response.ok) return;
+                const data = await response.json();
+                updateKbStatusUI(data);
+            } catch (error) {
+                console.warn('Failed to refresh KB status', error);
+            }
+        }
+
         // Simplified initialization - skip health checks and go directly to chat interface
         window.onload = () => {
             initializeApp();
@@ -1255,6 +1358,9 @@
                 document.getElementById('messageInput').focus();
                 console.log('App initialized successfully');
             }, 2000); // 2 second delay to show the loading screen briefly
+
+            refreshKbStatus();
+            setInterval(refreshKbStatus, 5000);
         }
 
         // Image modal functions

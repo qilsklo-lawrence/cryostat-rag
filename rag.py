@@ -1,5 +1,9 @@
 import os
 import time
+import json
+import hashlib
+import pickle
+from datetime import datetime
 from typing import Any, List, Tuple, Set, Dict, Optional
 import vertexai
 from vertexai.generative_models import GenerativeModel, ChatSession
@@ -42,6 +46,15 @@ EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))
 # GCS settings
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "oxford-rag-pdfs")
 GCS_PDF_PREFIX = "pdfs/"
+
+# Persistent storage paths (Cloud Run volume recommended)
+VECTORSTORE_BASE_DIR = os.getenv("VECTORSTORE_BASE_DIR", "/var/lib/cryostat-rag")
+VECTORSTORE_DIR = os.path.join(VECTORSTORE_BASE_DIR, "vectorstore")
+PDF_CACHE_DIR = os.getenv("PDF_CACHE_DIR", os.path.join(VECTORSTORE_BASE_DIR, "pdfs"))
+MANIFEST_PATH = os.path.join(VECTORSTORE_DIR, "manifest.json")
+IMAGE_STORAGE_PATH = os.path.join(VECTORSTORE_DIR, "images.pkl")
+VECTORSTORE_GCS_BUCKET = os.getenv("VECTORSTORE_GCS_BUCKET")
+VECTORSTORE_GCS_PREFIX = os.getenv("VECTORSTORE_GCS_PREFIX", "vectorstore/")
 
 # Global image storage to avoid ChromaDB metadata issues
 GLOBAL_IMAGE_STORAGE = {}
@@ -114,6 +127,141 @@ def download_pdfs_from_gcs(bucket_name: str, prefix: str, local_dir: str = "pdfs
     
     print(f"Downloaded {pdf_count} PDFs from GCS")
     return local_dir
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _compute_sha256_for_blob(blob) -> str:
+    hasher = hashlib.sha256()
+    with blob.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def _compute_sha256_for_file(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def compute_manifest_from_gcs(bucket_name: str, prefix: str, status_callback=None) -> Dict[str, Any]:
+    """Compute a full hash manifest for PDFs in GCS."""
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = [b for b in bucket.list_blobs(prefix=prefix) if b.name.endswith('.pdf')]
+
+    files = []
+    for i, blob in enumerate(sorted(blobs, key=lambda b: b.name)):
+        if status_callback:
+            status_callback("verifying", f"Hashing {os.path.basename(blob.name)} ({i+1}/{len(blobs)})")
+        file_hash = _compute_sha256_for_blob(blob)
+        files.append({
+            "name": os.path.basename(blob.name),
+            "sha256": file_hash,
+            "size": blob.size,
+            "updated": blob.updated.isoformat() if blob.updated else None
+        })
+
+    manifest = {
+        "bucket": bucket_name,
+        "prefix": prefix,
+        "hash_algo": "sha256",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "files": files
+    }
+    manifest["manifest_hash"] = _manifest_hash(manifest)
+    return manifest
+
+def compute_manifest_from_local(folder: str) -> Dict[str, Any]:
+    files = []
+    for fname in sorted(os.listdir(folder)):
+        if not fname.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(folder, fname)
+        files.append({
+            "name": fname,
+            "sha256": _compute_sha256_for_file(path),
+            "size": os.path.getsize(path),
+            "updated": datetime.utcfromtimestamp(os.path.getmtime(path)).isoformat() + "Z"
+        })
+    manifest = {
+        "bucket": None,
+        "prefix": None,
+        "hash_algo": "sha256",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "files": files
+    }
+    manifest["manifest_hash"] = _manifest_hash(manifest)
+    return manifest
+
+def _manifest_hash(manifest: Dict[str, Any]) -> str:
+    compact = json.dumps({
+        "bucket": manifest.get("bucket"),
+        "prefix": manifest.get("prefix"),
+        "hash_algo": manifest.get("hash_algo"),
+        "files": manifest.get("files", [])
+    }, sort_keys=True)
+    return hashlib.sha256(compact.encode("utf-8")).hexdigest()
+
+def load_manifest() -> Optional[Dict[str, Any]]:
+    if not os.path.exists(MANIFEST_PATH):
+        return None
+    with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_manifest(manifest: Dict[str, Any]):
+    _ensure_dir(VECTORSTORE_DIR)
+    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+
+def manifest_has_changed(old: Optional[Dict[str, Any]], new: Dict[str, Any]) -> bool:
+    if not old:
+        return True
+    return old.get("manifest_hash") != new.get("manifest_hash")
+
+def save_image_storage():
+    _ensure_dir(VECTORSTORE_DIR)
+    with open(IMAGE_STORAGE_PATH, "wb") as f:
+        pickle.dump(GLOBAL_IMAGE_STORAGE, f)
+
+def load_image_storage():
+    if not os.path.exists(IMAGE_STORAGE_PATH):
+        return
+    with open(IMAGE_STORAGE_PATH, "rb") as f:
+        data = pickle.load(f)
+        GLOBAL_IMAGE_STORAGE.clear()
+        GLOBAL_IMAGE_STORAGE.update(data)
+
+def _download_prefix(bucket_name: str, prefix: str, local_dir: str):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    _ensure_dir(local_dir)
+    for blob in bucket.list_blobs(prefix=prefix):
+        if blob.name.endswith('/'):
+            continue
+        rel_path = blob.name[len(prefix):]
+        local_path = os.path.join(local_dir, rel_path)
+        _ensure_dir(os.path.dirname(local_path))
+        blob.download_to_filename(local_path)
+
+def _upload_dir(bucket_name: str, prefix: str, local_dir: str):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    for root, _, files in os.walk(local_dir):
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(local_path, local_dir).replace("\\", "/")
+            blob = bucket.blob(prefix + rel_path)
+            blob.upload_from_filename(local_path)
+
+def sync_vectorstore_from_gcs():
+    if VECTORSTORE_GCS_BUCKET:
+        _download_prefix(VECTORSTORE_GCS_BUCKET, VECTORSTORE_GCS_PREFIX, VECTORSTORE_DIR)
+
+def sync_vectorstore_to_gcs():
+    if VECTORSTORE_GCS_BUCKET:
+        _upload_dir(VECTORSTORE_GCS_BUCKET, VECTORSTORE_GCS_PREFIX, VECTORSTORE_DIR)
 
 # Keep all the original chunking and retriever logic...
 # (I'll include the rest of your original functions with minor modifications)
@@ -208,7 +356,7 @@ def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
     return fine_docs, coarse_docs
 
 # ─── 6. ChromaDB setup ───────────────────────────────────────────────────────
-CHROMA_BASE_DIR   = "/tmp/chroma_db"  # Use /tmp for Cloud Run
+CHROMA_BASE_DIR   = os.path.join(VECTORSTORE_DIR, "chroma")
 CHROMA_FINE_DIR   = os.path.join(CHROMA_BASE_DIR, "fine")
 CHROMA_COARSE_DIR = os.path.join(CHROMA_BASE_DIR, "coarse")
 
@@ -217,13 +365,73 @@ def get_vectorstores(fine_docs: List[Document], coarse_docs: List[Document]):
     os.makedirs(CHROMA_COARSE_DIR, exist_ok=True)
     emb = VertexAIEmbeddings()
     
-    # Always rebuild for Cloud Run
     print("Building vector stores...")
     fine_db = Chroma.from_documents(fine_docs, emb, persist_directory=CHROMA_FINE_DIR)
     coarse_db = Chroma.from_documents(coarse_docs, emb, persist_directory=CHROMA_COARSE_DIR)
     print("Vector stores built successfully!")
     
     return fine_db, coarse_db
+
+def _vectorstore_exists() -> bool:
+    fine_db_file = os.path.join(CHROMA_FINE_DIR, "chroma.sqlite3")
+    coarse_db_file = os.path.join(CHROMA_COARSE_DIR, "chroma.sqlite3")
+    return os.path.exists(fine_db_file) and os.path.exists(coarse_db_file)
+
+def load_vectorstores_if_present() -> Tuple[Optional[Chroma], Optional[Chroma], bool]:
+    if not _vectorstore_exists():
+        return None, None, False
+    emb = VertexAIEmbeddings()
+    fine_db = Chroma(persist_directory=CHROMA_FINE_DIR, embedding_function=emb)
+    coarse_db = Chroma(persist_directory=CHROMA_COARSE_DIR, embedding_function=emb)
+    load_image_storage()
+    return fine_db, coarse_db, True
+
+def _clear_directory(folder: str):
+    if not os.path.exists(folder):
+        return
+    for fname in os.listdir(folder):
+        path = os.path.join(folder, fname)
+        if os.path.isfile(path):
+            os.remove(path)
+
+def build_vectorstores_from_gcs(status_callback=None) -> Tuple[Chroma, Chroma, Dict[str, Any]]:
+    if status_callback:
+        status_callback("downloading", "Downloading PDFs from storage...")
+    _ensure_dir(PDF_CACHE_DIR)
+    _clear_directory(PDF_CACHE_DIR)
+    pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX, PDF_CACHE_DIR)
+
+    if status_callback:
+        status_callback("chunking", "Parsing and chunking documents...")
+    fine_docs, coarse_docs = load_and_split_pdfs(pdf_folder)
+
+    if status_callback:
+        status_callback("embedding", "Creating embeddings and vector store...")
+    fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
+
+    save_image_storage()
+    manifest = compute_manifest_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX, status_callback=status_callback)
+    save_manifest(manifest)
+    sync_vectorstore_to_gcs()
+    return fine_db, coarse_db, manifest
+
+def verify_or_rebuild_vectorstores(status_callback=None) -> Tuple[Chroma, Chroma, Dict[str, Any], bool]:
+    """Verify GCS manifest and rebuild vectorstores if changed or missing."""
+    if status_callback:
+        status_callback("verifying", "Checking for document updates...")
+
+    existing_manifest = load_manifest()
+    new_manifest = compute_manifest_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX, status_callback=status_callback)
+    needs_rebuild = manifest_has_changed(existing_manifest, new_manifest) or not _vectorstore_exists()
+
+    if needs_rebuild:
+        if status_callback:
+            status_callback("rebuilding", "Rebuilding knowledge base...")
+        fine_db, coarse_db, manifest = build_vectorstores_from_gcs(status_callback=status_callback)
+        return fine_db, coarse_db, manifest, True
+
+    fine_db, coarse_db, _ = load_vectorstores_if_present()
+    return fine_db, coarse_db, existing_manifest or new_manifest, False
 
 # Include all your original retriever and conversation classes here...
 # (ContextExpandingHybridRetriever, ConversationHistory, etc.)
@@ -541,27 +749,31 @@ def extract_images_from_chunks(docs: List[Document]) -> List[Dict]:
     return images
 
 # ─── 7. Initialize RAG system ────────────────────────────────────────────────
-def initialize_rag_system():
-    """Initialize the RAG system by downloading PDFs and building vector stores"""
-    print("Initializing RAG system...")
-    
-    # Download PDFs from GCS
-    pdf_folder = download_pdfs_from_gcs(GCS_BUCKET_NAME, GCS_PDF_PREFIX)
-    
-    # Load and split PDFs
-    fine_docs, coarse_docs = load_and_split_pdfs(pdf_folder)
-    
-    # Create vector stores
-    fine_db, coarse_db = get_vectorstores(fine_docs, coarse_docs)
-    
-    # Create retriever
+def initialize_rag_system(status_callback=None):
+    """Initialize the RAG system by rebuilding vector stores from GCS."""
+    print("Initializing RAG system (full rebuild)...")
+    fine_db, coarse_db, _manifest = build_vectorstores_from_gcs(status_callback=status_callback)
     retriever = ContextExpandingHybridRetriever(fine_db, coarse_db)
-    
-    # Create LLM
     llm = VertexAIGeminiLLM()
-    
     print("RAG system initialized successfully!")
     return retriever, llm
+
+def load_rag_if_available() -> Tuple[Optional[ContextExpandingHybridRetriever], Optional[VertexAIGeminiLLM], bool]:
+    fine_db, coarse_db, loaded = load_vectorstores_if_present()
+    if not loaded:
+        return None, None, False
+    retriever = ContextExpandingHybridRetriever(fine_db, coarse_db)
+    llm = VertexAIGeminiLLM()
+    return retriever, llm, True
+
+def verify_or_rebuild_rag(status_callback=None) -> Tuple[ContextExpandingHybridRetriever, VertexAIGeminiLLM, Dict[str, Any]]:
+    fine_db, coarse_db, manifest, rebuilt = verify_or_rebuild_vectorstores(status_callback=status_callback)
+    retriever = ContextExpandingHybridRetriever(fine_db, coarse_db)
+    llm = VertexAIGeminiLLM()
+    return retriever, llm, {
+        "rebuilt": rebuilt,
+        "manifest": manifest
+    }
 
 # ─── 8. Query processing function for API ────────────────────────────────────
 def process_query(query: str, retriever, llm, conversation_history, debug_mode: bool = False, status_callback=None):
