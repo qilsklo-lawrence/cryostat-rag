@@ -264,7 +264,6 @@ def sync_vectorstore_to_gcs():
         _upload_dir(VECTORSTORE_GCS_BUCKET, VECTORSTORE_GCS_PREFIX, VECTORSTORE_DIR)
 
 # Keep all the original chunking and retriever logic...
-# (I'll include the rest of your original functions with minor modifications)
 
 def load_and_split_pdfs(folder: str) -> Tuple[List[Document], List[Document]]:
     fine_splitter = RecursiveCharacterTextSplitter(
