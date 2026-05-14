@@ -18,11 +18,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_community.vectorstores.utils import filter_complex_metadata
 
-try:
-    from sentence_transformers import CrossEncoder
-    CROSS_ENCODER_AVAILABLE = True
-except ImportError:
-    CROSS_ENCODER_AVAILABLE = False
+from google.cloud import discoveryengine_v1 as discoveryengine
 
 from langchain.embeddings.base import Embeddings
 from langchain.llms.base import LLM
@@ -50,11 +46,13 @@ CONTEXT_WINDOW_SIZE  = 3  # Number of previous queries to keep chunks for
 EXPAND_CONTEXT_BEFORE = int(os.getenv("EXPAND_CONTEXT_BEFORE", "1"))
 EXPAND_CONTEXT_AFTER = int(os.getenv("EXPAND_CONTEXT_AFTER", "2"))
 
-# Cross-encoder reranking
-CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "mixedbread-ai/mxbai-rerank-base-v1")
-USE_RERANKING = os.getenv("USE_RERANKING", "true").lower() == "true"
-RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "8"))
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "5"))
+# Vertex AI Ranking API reranking
+USE_RERANKING     = os.getenv("USE_RERANKING", "true").lower() == "true"
+RERANK_TOP_N      = int(os.getenv("RERANK_TOP_N", "8"))
+RERANK_MODEL      = os.getenv("RERANK_MODEL", "semantic-ranker-fast-004")
+_MAX_RECORD_CHARS = 3800  # ~1024-token safety truncation per API record
+_MAX_RERANK_DOCS  = 200   # API hard limit per request
+EMBED_BATCH_SIZE  = int(os.getenv("EMBED_BATCH_SIZE", "5"))
 
 # GCS settings
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "attocube-rag-pdfs")
@@ -75,17 +73,6 @@ GLOBAL_IMAGE_STORAGE = {}
 
 # Global BM25 document store for hybrid retrieval
 GLOBAL_BM25_DOCS: List[Document] = []
-
-# Cross-encoder singleton (lazy-loaded on first use)
-_cross_encoder_instance = None
-
-def get_cross_encoder():
-    global _cross_encoder_instance
-    if _cross_encoder_instance is None and CROSS_ENCODER_AVAILABLE and USE_RERANKING:
-        print(f"Loading cross-encoder model: {CROSS_ENCODER_MODEL}")
-        _cross_encoder_instance = CrossEncoder(CROSS_ENCODER_MODEL)
-        print("Cross-encoder model loaded.")
-    return _cross_encoder_instance
 
 # ─── 3. LLM wrapper for Vertex AI Gemini ────────────────────────────────────
 class VertexAIGeminiLLM(LLM):
@@ -533,18 +520,42 @@ class ContextExpandingHybridRetriever:
         return [item["doc"] for item in sorted_items]
 
     def rerank(self, query: str, docs: List[Document], top_n: int = None) -> List[Document]:
-        """Rerank docs with cross-encoder; falls back gracefully if unavailable."""
+        """Rerank docs via Vertex AI Ranking API; falls back gracefully on error."""
+        if not USE_RERANKING or not docs:
+            return docs
         if top_n is None:
             top_n = RERANK_TOP_N
-        ce = get_cross_encoder()
-        if ce is None or len(docs) <= top_n:
-            return docs[:top_n] if len(docs) > top_n else docs
-        pairs = [(query, doc.page_content) for doc in docs]
-        scores = ce.predict(pairs)
-        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-        # Drop chunks the cross-encoder considers irrelevant; always keep at least one
-        filtered = [(s, d) for s, d in ranked if s > -5.0] or [ranked[0]]
-        return [doc for _, doc in filtered[:top_n]]
+        if len(docs) <= top_n:
+            return docs
+
+        candidates = docs[:_MAX_RERANK_DOCS]
+        client = discoveryengine.RankServiceClient()
+        ranking_config = (
+            f"projects/{PROJECT_ID}/locations/global"
+            "/rankingConfigs/default_ranking_config"
+        )
+        records = [
+            discoveryengine.RankingRecord(
+                id=str(i),
+                content=doc.page_content[:_MAX_RECORD_CHARS],
+            )
+            for i, doc in enumerate(candidates)
+        ]
+        try:
+            response = client.rank(
+                discoveryengine.RankRequest(
+                    ranking_config=ranking_config,
+                    model=RERANK_MODEL,
+                    query=query,
+                    records=records,
+                    top_n=top_n,
+                )
+            )
+            id_map = {str(i): doc for i, doc in enumerate(candidates)}
+            return [id_map[r.id] for r in response.records if r.id in id_map]
+        except Exception as e:
+            print(f"Reranking API error (falling back to unranked top-{top_n}): {e}")
+            return docs[:top_n]
     
     def expand_context(self, docs: List[Document], db: Chroma, before: int = 1, after: int = 2) -> List[Document]:
         """Expand context by including neighboring chunks"""
@@ -1033,8 +1044,10 @@ Reformulated question (be specific and include context from the conversation):""
     print(f"DEBUG: Context expansion - Before: {EXPAND_CONTEXT_BEFORE + (1 if is_followup else 0)}, After: {EXPAND_CONTEXT_AFTER + (1 if is_followup else 0)}")
     print(f"DEBUG: Retrieved {len(docs)} documents before reranking")
 
-    # Cross-encoder reranking: score all candidates and keep top-N most relevant
+    # Vertex AI reranking: score all candidates and keep top-N most relevant
     if hasattr(retriever, "rerank"):
+        if status_callback:
+            status_callback("reranking", "Reranking results...")
         docs = retriever.rerank(effective_query, docs)
         print(f"DEBUG: {len(docs)} documents after reranking")
 
