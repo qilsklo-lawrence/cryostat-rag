@@ -342,7 +342,8 @@ def chat():
             'response': result['answer'],
             'sources': result['sources'],
             'images': images_b64,
-            'debug_info': result['debug_info']
+            'debug_info': result['debug_info'],
+            'needs_clarification': result.get('needs_clarification', False)
         })
     except Exception as e:
         # Clear status on error
